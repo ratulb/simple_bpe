@@ -40,6 +40,7 @@ from std.sys import size_of
 from std.base64 import b64encode, b64decode
 
 from pretokenizer import PreTokenizer, GPreTokenizer, ByteMapping
+from flat_storage import FlatTokenStorage
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +226,7 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
     var merge_cache: PairCache
     var byte_to_cp: Dict[Int, Int]
     var cp_to_byte: Dict[Int, Int]
-    var token_bytes: List[UInt8]
-    var token_offsets: List[Int]
-    var token_lengths: List[Int]
+    var storage: FlatTokenStorage
     var special_bytes: Dict[String, Int]
     var inverse_special: Dict[Int, String]
 
@@ -238,9 +237,7 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
         self.merge_cache = PairCache()
         self.byte_to_cp = Dict[Int, Int]()
         self.cp_to_byte = Dict[Int, Int]()
-        self.token_bytes = List[UInt8]()
-        self.token_offsets = List[Int]()
-        self.token_lengths = List[Int]()
+        self.storage = FlatTokenStorage()
         self.special_bytes = Dict[String, Int]()
         self.inverse_special = Dict[Int, String]()
         # GPT-2 bytes_to_unicode mapping (fixed at init, used by all methods)
@@ -283,16 +280,10 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
             raise Error("duplicate special token: " + text)
         while len(self.vocab) <= id:
             self.vocab.append(String())
-            self.token_offsets.append(len(self.token_bytes))
-            self.token_lengths.append(0)
         self.special_bytes[text] = id
         self.inverse_special[id] = text
         self.vocab[id] = text
-        var raw = text.as_bytes()
-        self.token_offsets[id] = len(self.token_bytes)
-        for i in range(len(raw)):
-            self.token_bytes.append(raw[i])
-        self.token_lengths[id] = len(raw)
+        self.storage.set(id, text.as_bytes())
 
     # ── training ────────────────────────────────────────────────────────
     # The algorithm:
@@ -328,23 +319,21 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
         # ---- 3. Initialise vocabulary -----------------------------------
         # IDs 0–255 are the 256 byte values, each mapped to its safe-Unicode
         # representation.  Merge tokens are appended below.
-        # token_bytes/token_offsates form a flat array: token i's bytes are
-        # token_bytes[token_offsets[i]:token_offsets[i+1]].
+        # storage holds token bytes in a single contiguous buffer:
+        # storage.buffer_ptr()[storage.token_offset(i):+storage.token_length(i)].
         # For SEQUENTIAL: rank == byte, so vocab[rank] = display(byte).
         # For SHUFFLED:   rank != byte, so we use id_to_byte(rank) to find
         # the raw byte for each rank, ensuring vocab[rank] is correct.
         self.vocab = List[String](capacity=vocab_size)
-        self.token_bytes = List[UInt8]()
-        self.token_offsets = List[Int](capacity=vocab_size + 1)
-        self.token_lengths = List[Int](capacity=vocab_size)
+        self.storage = FlatTokenStorage()
         for rank in range(256):
             var b = Self.PT.id_to_byte(rank)
             var display = chr(self.byte_to_cp[b])
             self.vocab.append(display)
-            self.token_offsets.append(len(self.token_bytes))
+            var raw = List[UInt8](capacity=display.byte_length())
             for cp in display.codepoints():
-                self.token_bytes.append(UInt8(self.cp_to_byte[Int(cp)]))
-            self.token_lengths.append(len(self.token_bytes) - self.token_offsets[rank])
+                raw.append(UInt8(self.cp_to_byte[Int(cp)]))
+            self.storage.set(rank, raw)
 
         # ---- 4. Build flat token-ID sequence with SEP sentinel ------------
         # Flatten the word-frequency structure into a single List[Int] with
@@ -445,22 +434,20 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
             # Build display string and flat byte storage.
             var merged_str = self.vocab[a_id].copy() + self.vocab[b_id].copy()
             self.vocab.append(merged_str)
-            self.token_offsets.append(len(self.token_bytes))
+            var raw = List[UInt8](capacity=merged_str.byte_length())
             var pending: Int = -1
             for cp in merged_str.codepoints():
                 var b = self.cp_to_byte[Int(cp)]
                 if b == 0xA0 and pending == 0xC4:
-                    self.token_bytes.append(UInt8(0x20))
+                    raw.append(UInt8(0x20))
                     pending = -1
                 else:
                     if pending >= 0:
-                        self.token_bytes.append(UInt8(pending))
+                        raw.append(UInt8(pending))
                     pending = b
             if pending >= 0:
-                self.token_bytes.append(UInt8(pending))
-            self.token_lengths.append(len(self.token_bytes) - self.token_offsets[len(self.token_offsets) - 1])
-        # Sentinel: last offset equals total byte count.
-        self.token_offsets.append(len(self.token_bytes))
+                raw.append(UInt8(pending))
+            self.storage.set(merged_id, raw)
 
     # ── encoding ─────────────────────────────────────────────────────────
     # The encoder uses greedy rank-based merge via PairCache:
@@ -604,32 +591,9 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
     # the cost of a separate string-level replace.
     # ─────────────────────────────────────────────────────────────────────
 
+    @always_inline
     def decode[mut: Bool, //, origin: Origin[mut=mut]](self, ids: Span[Int, origin]) raises -> String:
-        if len(ids) == 0:
-            return String("")
-        var total: Int = 0
-        for id in ids:
-            if id < 0 or id >= len(self.token_lengths):
-                raise Error("token ID out of range: " + String(id))
-            total += self.token_lengths[id]
-        if total == 0:
-            return String("")
-        var buf = alloc[UInt8](total)
-        var ptr = self.token_bytes.unsafe_ptr()
-        var write_offset: Int = 0
-        for id in ids:
-            var n = self.token_lengths[id]
-            if n > 0:
-                memcpy(
-                    dest=buf + write_offset,
-                    src=ptr + self.token_offsets[id],
-                    count=n,
-                )
-                write_offset += n
-        # ---- 3. Interpret bytes as UTF-8 (lossy) ------------------------
-        var result = String(from_utf8_lossy=Span[UInt8](ptr=buf, length=write_offset))
-        buf.free()
-        return result^
+        return self.storage.decode_to_string(ids)
 
     def __len__(self) -> Int:
         return len(self.vocab)
@@ -703,27 +667,24 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
         # and the merge list).
         var py_vocab = data["vocab"]
         tok.vocab = List[String](capacity=len(py_vocab))
-        tok.token_bytes = List[UInt8]()
-        tok.token_offsets = List[Int](capacity=len(py_vocab) + 1)
-        tok.token_lengths = List[Int](capacity=len(py_vocab))
+        tok.storage = FlatTokenStorage()
         for i in range(len(py_vocab)):
             var display = String(py_vocab[i])
             tok.vocab.append(display)
-            tok.token_offsets.append(len(tok.token_bytes))
+            var raw = List[UInt8](capacity=display.byte_length())
             var pending: Int = -1
             for cp in display.codepoints():
                 var b = tok.cp_to_byte[Int(cp)]
                 if b == 0xA0 and pending == 0xC4:
-                    tok.token_bytes.append(UInt8(0x20))
+                    raw.append(UInt8(0x20))
                     pending = -1
                 else:
                     if pending >= 0:
-                        tok.token_bytes.append(UInt8(pending))
+                        raw.append(UInt8(pending))
                     pending = b
             if pending >= 0:
-                tok.token_bytes.append(UInt8(pending))
-            tok.token_lengths.append(len(tok.token_bytes) - tok.token_offsets[i])
-        tok.token_offsets.append(len(tok.token_bytes))
+                raw.append(UInt8(pending))
+            tok.storage.set(i, raw)
 
         # Rebuild ordered merge list.
         var py_merges = data["merges"]
@@ -907,33 +868,24 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
 
         var new_vocab_size = max_id + 1
         var new_vocab = List[String](capacity=new_vocab_size)
-        var new_token_bytes = List[UInt8]()
-        var new_token_offsets = List[Int](capacity=new_vocab_size + 1)
-        var new_token_lengths = List[Int](capacity=new_vocab_size)
+        var new_storage = FlatTokenStorage()
         for token_id in range(new_vocab_size):
             var raw_bytes = Span[UInt8](all_tokens[token_id])
             var display = String(capacity=len(raw_bytes) * 3)
             for i in range(len(raw_bytes)):
                 display += chr(self.byte_to_cp[Int(raw_bytes[i])])
             new_vocab.append(display)
-            new_token_offsets.append(len(new_token_bytes))
-            var pending: Int = -1
-            for cp in display.codepoints():
-                var b = self.cp_to_byte[Int(cp)]
-                if b == 0xA0 and pending == 0xC4:
-                    new_token_bytes.append(UInt8(0x20))
-                    pending = -1
+            # Build storage bytes with Ġ→0x20 substitution (0xC4 0xA0 → 0x20).
+            var raw = List[UInt8](capacity=len(raw_bytes))
+            var i = 0
+            while i < len(raw_bytes):
+                if i + 1 < len(raw_bytes) and raw_bytes[i] == 0xC4 and raw_bytes[i + 1] == 0xA0:
+                    raw.append(UInt8(0x20))
+                    i += 2
                 else:
-                    if pending >= 0:
-                        new_token_bytes.append(UInt8(pending))
-                    pending = b
-            if pending >= 0:
-                new_token_bytes.append(UInt8(pending))
-            new_token_lengths.append(
-                len(new_token_bytes)
-                - new_token_offsets[len(new_token_offsets) - 1]
-            )
-        new_token_offsets.append(len(new_token_bytes))
+                    raw.append(raw_bytes[i])
+                    i += 1
+            new_storage.set(token_id, raw)
 
         self._recover_merges(mergeable_ranks, all_tokens)
 
@@ -942,9 +894,7 @@ struct BPETokenizer[PT: PreTokenizer = GPreTokenizer](Sized & Movable):
             new_merge_cache.set(merge.first, merge.second, merge.merged)
 
         self.vocab = new_vocab^
-        self.token_bytes = new_token_bytes^
-        self.token_offsets = new_token_offsets^
-        self.token_lengths = new_token_lengths^
+        self.storage = new_storage^
         self.merge_cache = new_merge_cache^
 
         for item in Self.PT.special_tokens().items():
