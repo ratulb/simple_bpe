@@ -116,11 +116,11 @@ struct FlatTokenStorage(Sized & Movable):
 
     @always_inline
     def token_offset(self, id: Int) -> Int:
-        return self._offsets[id]
+        return self._offsets.unsafe_ptr()[id]
 
     @always_inline
     def token_length(self, id: Int) -> Int:
-        return self._lengths[id]
+        return self._lengths.unsafe_ptr()[id]
 
     def decode_to_string[origin: Origin, //](ref self, ids: Span[Int, origin]) raises -> String:
         """Decode a span of token IDs into a string using raw pointer access."""
