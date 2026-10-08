@@ -3,6 +3,7 @@
 from std.pathlib import Path
 from std.python import Python
 
+comptime Char = String
 
 struct PreTokenizer:
     @staticmethod
@@ -42,12 +43,12 @@ struct BPETokenizer(Sized & Movable):
                 word_freqs[word] = 1 + word_freqs.get(word, 0)
 
         # 2. Build the alphabet from all unique characters
-        var alphabet: List[String] = []
+        var alphabet: List[Char] = []
         for word in word_freqs.keys():
-            for letter in word.codepoints():
-                var char_str = chr(Int(letter))
-                if char_str not in alphabet:
-                    alphabet.append(char_str)
+            for cp in word.codepoints():
+                var char = chr(Int(cp))
+                if char not in alphabet:
+                    alphabet.append(char)
         sort(alphabet)
 
         # 3. Initialize vocab: special token + every character
@@ -60,9 +61,9 @@ struct BPETokenizer(Sized & Movable):
             self.stoi[char] = i + 1
 
         # 4. Split each word into individual characters
-        var splits = Dict[String, List[String]]()
+        var splits = Dict[String, List[Char]]()
         for word in word_freqs.keys():
-            splits[word] = [chr(Int(c)) for c in word.codepoints()]
+            splits[word] = [chr(Int(cp)) for cp in word.codepoints()]
 
         # 5. Iteratively merge the most frequent pair
         self.merges = Dict[Tuple[String, String], String]()
@@ -89,7 +90,7 @@ struct BPETokenizer(Sized & Movable):
             return List[String]()
         var words = PreTokenizer.tokenize(text)
         var splits = [
-            [chr(Int(code)) for code in word.codepoints()]
+            [chr(Int(cp)) for cp in word.codepoints()]
             for word in words
         ]
         for pair_merge in self.merges.items():
