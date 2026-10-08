@@ -233,7 +233,7 @@ struct BPETokenizer(Sized & Movable):
             return List[String]()
         # Same word split as in training. The words must be cut the same way,
         # or the learned rules would not line up with the pieces.
-        var words = PreTokenizer.tokenize(text)
+        var words = PreTokenizer.split(text)
         # One list of single-character tokens per word.
         var splits = [
             [chr(Int(cp)) for cp in word.codepoints()]
