@@ -6,14 +6,16 @@ from std.python import Python
 
 struct PreTokenizer:
     @staticmethod
-    def tokenize[
+    def split[
         spacer: StaticString = "Ġ",
     ](var text: String) raises -> List[String]:
+        """Split on whitespace and whitespace is replaced by "Ġ"
+        """
         var splits = (
             StringSlice(text)
-            .replace(" ", " " + spacer)
-            .replace(".", " .")
-            .split(" ")
+            .replace(" ", " " + spacer) # Replace ' '(whitespace)  with ' 'Ġ
+            .replace(".", " .") # Prefix "." with " ."
+            .split(" ") # Take out all whitespaces finally
         )
         var result = List[String](capacity=len(splits))
         for split in splits:
@@ -35,7 +37,7 @@ struct BPETokenizer(Sized & Movable):
         # 1. Pre-tokenize and compute word frequencies
         var word_freqs = Dict[String, Int]()
         for text in corpus:
-            var words = PreTokenizer.tokenize(text)
+            var words = PreTokenizer.split(text)
             for word in words:
                 word_freqs[word] = 1 + word_freqs.get(word, 0)
 
